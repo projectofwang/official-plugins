@@ -13,7 +13,7 @@ local statusInFlight = false
 local opInFlight = false
 local lastStatusKey = ""
 local pendingClear = nil -- { text, ticksLeft }
-local weStartedServe = false
+local servePortStarted = nil -- port bw serve was started on by this runtime (nil = none)
 local sessionUnlocked = false
 local unlockDeadlineTick = nil
 local pendingQuietLock = false
@@ -201,7 +201,7 @@ local function startServe()
   -- loopback only, detached (never --hostname all)
   local cmd = `bw serve --hostname 127.0.0.1 --port {port} >/dev/null 2>&1 &`
   log(`starting serve on 127.0.0.1:{port}`)
-  weStartedServe = true
+  servePortStarted = port
   noctalia.runAsync(cmd)
 end
 
@@ -290,20 +290,24 @@ local function pollStatus()
   end)
 end
 
+-- Reaps a bw serve bound to `port` only, the anchor is the port argument, and
+-- `bw[.]js serve` covers the nix wrapper, so strangers are never signalled.
+local function serveKillCmd(port)
+  return `pkill -f '(^|/)(bw[.]js serve|bw serve).*--port[ =]{port}([^0-9]|$)' >/dev/null 2>&1 || true`
+end
+
 local function stopServe(onDone)
   local port = servePort()
-  -- nix wraps bw as node bw.js: kill by port first
-  local cmd = table.concat({
-    `fuser -k {port}/tcp >/dev/null 2>&1 || true`,
-    `pkill -f 'bw\\.js serve' >/dev/null 2>&1 || true`,
-    `pkill -f 'bw serve' >/dev/null 2>&1 || true`,
-  }, "; ")
+  local cmd = serveKillCmd(port)
+  if servePortStarted ~= nil and servePortStarted ~= port then
+    -- Serve Port changed since we launched serve: also reap the port we bound.
+    -- ponytail: one remembered port, not an ownership ledger - a stale entry
+    -- can only match a bw serve carrying that exact --port, never a stranger
+    cmd ..= "; " .. serveKillCmd(servePortStarted)
+  end
   log(`stopping serve (port {port})`)
-  noctalia.runAsync(cmd, function()
-    if onDone ~= nil then
-      onDone()
-    end
-  end, 5000)
+  -- teardown (nil onDone) stays detached: the kill must outlive this runtime
+  noctalia.runAsync(cmd, onDone, if onDone ~= nil then 5000 else nil)
 end
 
 local function restartServe(onDone)
@@ -314,7 +318,7 @@ local function restartServe(onDone)
     noctalia.runAsync(
       `sleep 0.3; bw serve --hostname 127.0.0.1 --port {port} >/dev/null 2>&1 &`,
       function()
-        weStartedServe = true
+        servePortStarted = port
         if onDone ~= nil then
           onDone()
         end
@@ -908,7 +912,11 @@ function update()
   end
 end
 
-function onExit(_signal)
+function onExit(_signal, reason)
+  -- stop serve, the lock below still runs for on_restart as a fallback
+  if reason == "disable" or reason == "uninstall" then
+    stopServe()
+  end
   -- detached lock only for on_restart; awaiting HTTP on teardown can stall the host
   if vaultTimeoutMode() == "on_restart" and status.vault == "unlocked" then
     local port = servePort()
